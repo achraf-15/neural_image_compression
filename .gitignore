@@ -1,0 +1,17 @@
+# Ignore data folder
+data/
+
+# Common Python ignores
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.env
+.venv
+*.log
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/

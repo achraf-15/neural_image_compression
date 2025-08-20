@@ -6,13 +6,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Tuple
 
-class FactorizedEntropyBottleneck(nn.Module):
+class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implementation
     def __init__(self, channels: int, init_scale=10.0, hidden_dims: Tuple[int, ...] = (3, 3, 3)):
         super().__init__()
         self.channels = int(channels)
         self.init_scale = float(init_scale)
         self.filters = tuple(int(f) for f in hidden_dims)
-        #K = 1 + len(self.r)         # total layers (last is sigmoid)
         self.dtype = torch.float32
 
         filters_full = (1,) + self.filters + (1,)
@@ -41,7 +40,7 @@ class FactorizedEntropyBottleneck(nn.Module):
                 # TF applies tanh to factor; we'll apply tanh in forward
                 self.factors.append(f)
 
-    def _logits_cumulative(self, inputs: Tensor, stop_gradient: bool, debug=False):
+    def _logits_cumulative(self, inputs: Tensor, debug=False): 
         """
         inputs expected shape: (C, 1, N) where N is flattened batch*spatial.
         returns logits of same shape.
@@ -51,20 +50,16 @@ class FactorizedEntropyBottleneck(nn.Module):
         for i in range(len(self.matrices)):
             matrix_raw = self.matrices[i]
             matrix = F.softplus(matrix_raw)  # ensure positivity similar to TF pattern
-            if stop_gradient:
-                matrix = matrix.detach()
+
             # matrix shape: (C, out, in); logits shape: (C, in, N)
             # perform batch (channel-wise) matmul: for each channel
             logits = torch.matmul(matrix, logits)
             bias = self.biases[i]
-            if stop_gradient:
-                bias = bias.detach()
+
             logits = logits + bias  # (C, out, N)
             # if factor exists, apply nonlinearity
             if i < len(self.factors):
                 factor = self.factors[i]
-                if stop_gradient:
-                    factor = factor.detach()
                 factor_t = torch.tanh(factor)
                 logits = logits + factor_t * torch.tanh(logits)
 
@@ -80,7 +75,7 @@ class FactorizedEntropyBottleneck(nn.Module):
         inputs: real tensor (B, C, ...) (after noise or dequant)
         returns likelihood per element same shape
         """
-        # convert to (C, 1, batch) collapsed form similar to TF
+        # convert to (C, 1, batch) 
         # move channel to front
         shape = inputs.shape
         if inputs.dim() < 2:
@@ -99,7 +94,6 @@ class FactorizedEntropyBottleneck(nn.Module):
         lower = self._logits_cumulative(flat - half, stop_gradient=False)
         upper = self._logits_cumulative(flat + half, stop_gradient=False, debug=debug)
 
-        # sign trick: choose sign so subtraction occurs in left tail
         # sign = -sign(lower + upper); stop gradient through sign
         s = -torch.sign(lower + upper)
         s = s.detach()
@@ -133,7 +127,7 @@ class FactorizedEntropyBottleneck(nn.Module):
 
 
 class EntropyParameters(nn.Module):
-    def __init__(self, latent_channels=192, K=1):
+    def __init__(self, latent_channels=192, hyper_latent_channels=192, K=1):
         super().__init__()
         
         if not isinstance(K, int) or K < 1:
@@ -142,10 +136,11 @@ class EntropyParameters(nn.Module):
         self.K = K
         self.distribution = 'Mean-Scale Gaussian' if K == 1 else 'Mixture of Gaussians'
         self.latent_channels = latent_channels
+        self.hyper_latent_channels = hyper_latent_channels
 
         if self.distribution == 'Mean-Scale Gaussian':
             self.net = nn.Sequential(
-                nn.Conv2d(4 * self.latent_channels, 640, kernel_size=1),
+                nn.Conv2d(2 * self.latent_channels + 2 * self.hyper_latent_channels, 640, kernel_size=1),
                 nn.LeakyReLU(),
                 nn.Conv2d(640, 640, kernel_size=1),
                 nn.LeakyReLU(),
@@ -153,7 +148,7 @@ class EntropyParameters(nn.Module):
             )
         if self.distribution == 'Mixture of Gaussians':
             self.net = nn.Sequential(
-                nn.Conv2d(4 * self.latent_channels, 640, kernel_size=1),
+                nn.Conv2d(2 * self.latent_channels + 2 * self.hyper_latent_channels, 640, kernel_size=1),
                 nn.LeakyReLU(),
                 nn.Conv2d(640, 640, kernel_size=1),
                 nn.LeakyReLU(),
@@ -230,7 +225,7 @@ def discretized_mixture_pmf(x: torch.Tensor, weights: torch.Tensor, mus: torch.T
     return pmf_mixture.clamp_min(eps)
 
 # ---------------------
-# Discretized sigmoid mass (CDF difference)
+# Discretized Sigmoid mass (CDF difference)
 # ---------------------
 def discretized_sigmoid_pmf(x: torch.Tensor, eps: float=1e-12):
     """

@@ -8,7 +8,7 @@ import numpy as np
 from tqdm import tqdm
 
 # --------------------
-# Helper functions
+# Helper functions ( AI Generated )
 # --------------------
 def add_quantization_noise(img, levels=256):
     np_img = np.array(img).astype(np.float32) / 255.0

@@ -15,3 +15,11 @@ build/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+# TensorBoard logs
+runs/
+
+# PyTorch checkpoints
+checkpoints/
+*.pth
+*.pt

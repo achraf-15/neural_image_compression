@@ -31,7 +31,7 @@ def rd_loss(model_out: dict, x: torch.Tensor, lambda_rd: float):
     psnr_per_image = -10 * torch.log10(mse_per_image + eps)
 
     # Lagrangian loss
-    loss = bpp_total + lambda_rd * mse
+    loss = bpp_total + lambda_rd * (255**2) * mse
 
     return {
         'loss': loss,

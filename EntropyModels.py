@@ -1,14 +1,59 @@
 import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Tuple
 
-class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implementation
-    def __init__(self, channels: int, init_scale=10.0, hidden_dims: Tuple[int, ...] = (3, 3, 3)):
+from utils import gaussian_cdf
+
+
+class EntropyModel(nn.Module):
+    """
+    Base class for entropy models. Defines the core interface:
+    - _likelihood: compute per-element probability mass
+    - forward: wrapper returning likelihoods
+    - likelihood_bound: lower bound for numerical stability
+    """
+    def __init__(self, likelihood_lower_bound: float = 1e-9):
         super().__init__()
+        self.likelihood_lower_bound = likelihood_lower_bound
+
+    def _likelihood(self, inputs: Tensor, **kwargs) -> Tensor:
+        """
+        Abstract method: should be implemented by subclasses.
+        Returns per-element likelihood (same shape as inputs).
+        """
+        raise NotImplementedError
+
+    def forward(self, inputs: Tensor, **kwargs) -> Tensor:
+        """Compute likelihood clamped by likelihood_bound."""
+        return self._likelihood(inputs, **kwargs).clamp_min(self.likelihood_lower_bound)
+
+    def channel_cdf(self, ch: int, x: torch.Tensor) -> torch.Tensor: 
+        """Learned CDF for one channel at points x."""
+        raise NotImplementedError
+
+    def channel_pmf(self, ch: int, x: torch.Tensor) -> torch.Tensor: 
+        """
+        Learned discrete PMF for integer bins centered at x (can be real-valued too),
+        computed as CDF(x+0.5) - CDF(x-0.5).
+        """
+        raise NotImplementedError    
+
+    @property
+    def likelihood_bound(self) -> float:
+        return self.likelihood_lower_bound
+
+
+class FactorizedEntropyBottleneck(EntropyModel): # Similar to tensorflow TFC implementation
+    """
+    Entropy bottleneck layer, introduced by J. Ballé, D. Minnen, S. Singh,
+    S. J. Hwang, N. Johnston, in `"Variational image compression with a scale
+    hyperprior" <https://arxiv.org/abs/1802.01436>`
+    """
+    def __init__(self, channels: int, init_scale: float = 10.0, hidden_dims: Tuple[int, ...] = (3, 3, 3), likelihood_lower_bound: float = 1e-9):
+        super().__init__(likelihood_lower_bound)
         self.channels = int(channels)
         self.init_scale = float(init_scale)
         self.filters = tuple(int(f) for f in hidden_dims)
@@ -40,7 +85,7 @@ class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implem
                 # TF applies tanh to factor; we'll apply tanh in forward
                 self.factors.append(f)
 
-    def _logits_cumulative(self, inputs: Tensor, debug=False): 
+    def _logits_cumulative(self, inputs: Tensor): 
         """
         inputs expected shape: (C, 1, N) where N is flattened batch*spatial.
         returns logits of same shape.
@@ -63,14 +108,9 @@ class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implem
                 factor_t = torch.tanh(factor)
                 logits = logits + factor_t * torch.tanh(logits)
 
-        if debug:
-            for i, M in enumerate(self.matrices):
-                M_sp = F.softplus(M)
-                print(f"matrix {i} softplus: min {M_sp.min().item():.3e}, max {M_sp.max().item():.3e}")
-
         return logits
 
-    def _likelihood(self, inputs: Tensor, debug=False):
+    def _likelihood(self, inputs: Tensor):
         """
         inputs: real tensor (B, C, ...) (after noise or dequant)
         returns likelihood per element same shape
@@ -91,8 +131,8 @@ class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implem
         flat = x.view(C, 1, -1)  # shape (C, 1, N)
 
         half = 0.5
-        lower = self._logits_cumulative(flat - half, stop_gradient=False)
-        upper = self._logits_cumulative(flat + half, stop_gradient=False, debug=debug)
+        lower = self._logits_cumulative(flat - half)
+        upper = self._logits_cumulative(flat + half)
 
         # sign = -sign(lower + upper); stop gradient through sign
         s = -torch.sign(lower + upper)
@@ -102,15 +142,6 @@ class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implem
         lower_s = torch.sigmoid(s * lower)
         pmf = torch.abs(upper_s - lower_s)  # (C, 1, N)
 
-        # Debuging: check numeric ranges/gradients
-        if debug:
-            with torch.no_grad():
-                print("pmf min, max:", pmf.min().item(), pmf.max().item())
-                print("lower logits min/max:", lower.min().item(), lower.max().item())
-                print("upper logits min/max:", upper.min().item(), upper.max().item())
- 
-
-        
         # reshape back to original (B, C, *spatial)
         pmf = pmf.view(C, *x.shape[1:])  # (C, B, ...)
         # permute back: original perm was [1,0,...] so invert:
@@ -119,123 +150,86 @@ class FactorizedEntropyBottleneck(nn.Module): # Similar to tensorflow TFC implem
         pmf = pmf.permute(1, 0, *range(2, pmf.dim()))
         return pmf
 
-    def forward(self, x: torch.Tensor, debug=False, eps: float=1e-12) -> torch.Tensor:
+    @torch.no_grad()
+    def channel_logits_cumulative(self, ch: int, x: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, C, H, W] -> returns cdf(x) in (0,1), same shape.
+        Compute logits of the learned CDF for one channel over x.
+        x: 1D tensor of shape [N] on the same device/dtype as the module.
+        Returns: logits of shape [N]
         """
-        return self._likelihood(x, debug).clamp_min(eps)
-
-
-class EntropyParameters(nn.Module):
-    def __init__(self, latent_channels=192, hyper_latent_channels=192, K=1):
-        super().__init__()
-        
-        if not isinstance(K, int) or K < 1:
-            raise ValueError(f"K must be int >= 1, got {K}")
-
-        self.K = K
-        self.distribution = 'Mean-Scale Gaussian' if K == 1 else 'Mixture of Gaussians'
-        self.latent_channels = latent_channels
-        self.hyper_latent_channels = hyper_latent_channels
-
-        if self.distribution == 'Mean-Scale Gaussian':
-            self.net = nn.Sequential(
-                nn.Conv2d(2 * self.latent_channels + 2 * self.hyper_latent_channels, 640, kernel_size=1),
-                nn.LeakyReLU(),
-                nn.Conv2d(640, 640, kernel_size=1),
-                nn.LeakyReLU(),
-                nn.Conv2d(640, 2 * self.latent_channels, kernel_size=1)  # outputs [mu|sigma] stacked
-            )
-        if self.distribution == 'Mixture of Gaussians':
-            self.net = nn.Sequential(
-                nn.Conv2d(2 * self.latent_channels + 2 * self.hyper_latent_channels, 640, kernel_size=1),
-                nn.LeakyReLU(),
-                nn.Conv2d(640, 640, kernel_size=1),
-                nn.LeakyReLU(),
-                nn.Conv2d(640, 3 * self.K * self.latent_channels, kernel_size=1)  # outputs [w_1..w_K|mu_1..mu_K|sigma_1..sigma_K] stacked
-            )
-
-    def forward(self, combined_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        combined_feat: concat along channel dim of hyperdecoder features and context features; shape [B, phi|psi, H, W]
-        returns (mu, scale) each shape [B, M, H, W], scale enforced positive via softplus, if distrubtion is Mean-Scale Gaussian
-        returns (weights{1:K}, mus{1:K}, scales{1:K}), each shape [B, M, H, W], scale enforced positive via softplus, if distrubtion is Mixture of Gaussians
-        """
-        out = self.net(combined_feat)
-        
-        if self.distribution == 'Mean-Scale Gaussian': 
-            mu, sigma = out.chunk(2, dim=1)
-            sigma = F.softplus(sigma) + 1e-6 # use softplus/clip sigma to ensure positive scale, and stay away from 0
-            return mu, sigma
-            
-        elif self.distribution == 'Mixture of Gaussians': 
-            # Split into weights, mus, sigmas
-            weights, mus, sigmas = torch.chunk(out, 3, dim=1)
-            
-            # Reshape from [B, 3*K*M, H, W] → [B, K, M, H, W]
-            weights = weights.view(weights.size(0), self.K, self.latent_channels, *weights.shape[2:])
-            mus     = mus.view(mus.size(0), self.K, self.latent_channels, *mus.shape[2:])
-            sigmas  = sigmas.view(sigmas.size(0), self.K, self.latent_channels, *sigmas.shape[2:])
-            
-            # Softmax over K for mixture weights
-            weights = F.softmax(weights, dim=1)
-            # Ensure sigma > 0
-            sigmas = F.softplus(sigmas) + 1e-6
-            
-            return weights, mus, sigmas
-            
-
-# ---------------------
-# Discretized Gaussian mass (CDF difference)
-# ---------------------
-def gaussian_cdf(x: torch.Tensor):
-    """Standard normal CDF via erf"""
-    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
-
-def discretized_gaussian_pmf(x: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, eps: float=1e-12):
-    """
-    Compute P(bin) using Gaussian CDF differences.
-    x: relaxed latent value (y_tilde) or integer centers at eval time (y_hat)
-    mu, sigma: broadcastable to x shape
-    returns: probability of the discrete bin containing x
-    """
-    upper = (x + 0.5 - mu) / sigma
-    lower = (x - 0.5 - mu) / sigma
-    cdf_upper = gaussian_cdf(upper)
-    cdf_lower = gaussian_cdf(lower)
-    mass = (cdf_upper - cdf_lower).clamp_min(1e-12)
-    return mass
-
-def discretized_mixture_pmf(x: torch.Tensor, weights: torch.Tensor, mus: torch.Tensor, sigmas: torch.Tensor, eps: float=1e-12):
-    """
-    Mixture of Gaussians PMF.
-    x:      [B, M, H, W]
-    weights: [B, K, M, H, W]
-    mus:     [B, K, M, H, W]
-    sigmas:  [B, K, M, H, W]
-    """
-    # Expand x for broadcasting: [B, 1, M, H, W]
-    x_exp = x.unsqueeze(1)
+        # Slice parameters for the selected channel (faster and simpler than building (C,1,N))
+        logits = x.view(1, 1, -1)  # shape (1, 1, N)
+        for i in range(len(self.matrices)):
+            M = F.softplus(self.matrices[i][ch:ch+1, :, :])  # (1, out, in)
+            b = self.biases[i][ch:ch+1, :, :]                                  # (1, out, 1)
+            logits = torch.matmul(M, logits) + b                               # (1, out, N)
+            if i < len(self.factors):
+                f = torch.tanh(self.factors[i][ch:ch+1, :, :])                 # (1, out, 1)
+                logits = logits + f * torch.tanh(logits)
+        return logits.view(-1)  # (N,)
     
-    # PMF per Gaussian: [B, K, M, H, W]
-    pmf_per_gauss = discretized_gaussian_pmf(x_exp, mus, sigmas, eps)
+    @torch.no_grad()
+    def channel_cdf(self, ch: int, x: torch.Tensor) -> torch.Tensor:
+        """Learned CDF for one channel at points x."""
+        return torch.sigmoid(self.channel_logits_cumulative(ch, x))
     
-    # Weighted sum across mixture components K
-    pmf_mixture = torch.sum(weights * pmf_per_gauss, dim=1)  # → [B, M, H, W]
-    return pmf_mixture.clamp_min(eps)
+    @torch.no_grad()
+    def channel_pmf(self, ch: int, x: torch.Tensor) -> torch.Tensor:
+        """
+        Learned discrete PMF for integer bins centered at x (can be real-valued too),
+        computed as CDF(x+0.5) - CDF(x-0.5).
+        """
+        Lp = self.channel_logits_cumulative(ch, x + 0.5)
+        Lm = self.channel_logits_cumulative(ch, x - 0.5)
+        return (torch.sigmoid(Lp) - torch.sigmoid(Lm)).clamp_min(1e-12)
 
-# ---------------------
-# Discretized Sigmoid mass (CDF difference)
-# ---------------------
-def discretized_sigmoid_pmf(x: torch.Tensor, eps: float=1e-12):
-    """
-    Compute P(bin) using a sigmoid CDF differences (We use the sigmoid function as replacement of the CDF: CDF(x) = sigmoid(x) in [0,1])
-    x: relaxed latent value (y_tilde) or integer centers at eval time (y_hat)
-    returns: probability of the discrete bin containing x
-    """
-    upper = (x + 0.5) 
-    lower = (x - 0.5) 
-    cdf_upper = torch.sigmoid(upper)
-    cdf_lower = torch.sigmoid(lower)
-    mass = (cdf_upper - cdf_lower).clamp_min(1e-12)
-    return mass
+
+
+class GaussianConditional(EntropyModel):
+    def __init__(self, likelihood_lower_bound=1e-9):
+        super().__init__(likelihood_lower_bound)
+
+    def discretized_gaussian_pmf(self, x: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor):
+        """
+        Compute P(bin) using Gaussian CDF differences.
+        x: relaxed latent value (y_tilde) or integer centers at eval time (y_hat)
+        mu, sigma: broadcastable to x shape
+        returns: probability of the discrete bin containing x
+        """
+        upper = (x + 0.5 - mu) / sigma
+        lower = (x - 0.5 - mu) / sigma
+        cdf_upper = gaussian_cdf(upper)
+        cdf_lower = gaussian_cdf(lower)
+        mass = cdf_upper - cdf_lower
+        return mass
+    
+    def _likelihood(self, x: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
+        return self.discretized_gaussian_pmf(x, mu, sigma)
+   
+
+class GaussianMixtureConditional(GaussianConditional):
+    def __init__(self, likelihood_lower_bound=1e-9):
+        super().__init__(likelihood_lower_bound)
+
+    def discretized_mixture_pmf(self, x: torch.Tensor, weights: torch.Tensor, mus: torch.Tensor, sigmas: torch.Tensor):
+        """
+        Mixture of Gaussians PMF.
+        x:      [B, M, H, W]
+        weights: [B, K, M, H, W]
+        mus:     [B, K, M, H, W]
+        sigmas:  [B, K, M, H, W]
+        """
+        # Expand x for broadcasting: [B, 1, M, H, W]
+        x_exp = x.unsqueeze(1)
+        
+        # PMF per Gaussian: [B, K, M, H, W]
+        pmf_per_gauss = self.discretized_gaussian_pmf(x_exp, mus, sigmas)
+        
+        # Weighted sum across mixture components K
+        pmf_mixture = torch.sum(weights * pmf_per_gauss, dim=1)  # → [B, M, H, W]
+        return pmf_mixture
+    
+    def _likelihood(self, x: torch.Tensor, weights: torch.Tensor, mus: torch.Tensor, sigmas: torch.Tensor) -> Tensor:
+        return self.discretized_mixture_pmf(x, weights, mus, sigmas)
+
+      

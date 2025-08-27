@@ -6,6 +6,14 @@ import math
 import os
 from pytorch_msssim import ms_ssim
 
+def normalize_map(x, method="minmax"):
+    x = x.astype(np.float32)
+    if method == "minmax":
+        return (x - x.min()) / (x.max() - x.min() + 1e-12)
+    elif method == "std":
+        return (x - x.mean()) / (x.std() + 1e-12)
+    return x
+
 class CompressionEvaluator:
     def __init__(self, model, dataloader, device, lambda_val, save_dir="./eval_results"):
         self.model = model
@@ -115,29 +123,37 @@ class CompressionEvaluator:
         with torch.no_grad():
             out = self.model(img, training=False)
         
-        latents = out["y"][0]  # [C,H,W]
-        entropy = out["logp_y"][0]  # [C,H,W]
-        mean_entropy_per_channel = entropy.view(latents.shape[0], -1).mean(dim=1)
+        latents = out["y"][0]  # [C,H,W] # y or y_in ??
+        entropies = out["logp_y"][0]  # [C,H,W]
+        mean_entropy_per_channel = entropies.view(latents.shape[0], -1).mean(dim=1)
+
+        hyper_latents = out["z"][0 ]  # [C,H,W] # z or z_in ??
+        hyper_entropies = out["logp_z"][0] 
+        mean_entropy_per_z_channel = hyper_entropies.view(hyper_latents.shape[0], -1).mean(dim=1)
+    
         
-        # Pick highest entropy channel
-        high_c = torch.argmax(mean_entropy_per_channel).item()
+        # Pick highest entropy channel ( since entropy = -logp, we use argmin not argmax ) 
+        high_c = torch.argmin(mean_entropy_per_channel).item()
+        high_cz = torch.argmin(mean_entropy_per_z_channel).item()
         
         # Case 1: Mean-Scale Gaussian (K=1)
         if "mu" in out and "sigma" in out:
             mean = out["mu"][0, high_c]
             scale = out["sigma"][0, high_c]
             latent = latents[high_c]
-            pred_error = latent - mean
-            latent_entropy = entropy[high_c]
-            hyper_entropy = out["logp_z"][0, high_c]
+            hyper_latent = hyper_latents[high_cz]
+            norm_latent = (latent - mean) / (scale + 1e-12)  
+            latent_entropy = -entropies[high_c] / math.log(2.0) 
+            hyper_entropy = -hyper_entropies[high_cz] / math.log(2.0) 
             
             maps = [
                 ("Original", img_np),
-                ("Latent", latent.cpu().numpy()),
-                ("Predicted Mean", mean.cpu().numpy()),
-                ("Prediction Error", pred_error.cpu().numpy()),
-                ("Predicted Scale", scale.cpu().numpy()),
-                ("Latent Entropy", latent_entropy.cpu().numpy()),
+                ("Latent", normalize_map(latent.cpu().numpy())),
+                ("Predicted Mean", normalize_map(mean.cpu().numpy())),
+                ("Predicted Scale", normalize_map(scale.cpu().numpy())),
+                ("Normalized Latent", normalize_map(norm_latent.cpu().numpy())),
+                ("Latent Entropy", normalize_map(latent_entropy.cpu().numpy())),
+                ("Hyper Latent", hyper_latent.cpu().numpy()),
                 ("Hyper Entropy", hyper_entropy.cpu().numpy())
             ]
             
@@ -145,8 +161,11 @@ class CompressionEvaluator:
             for ax, (title, data) in zip(axes, maps):
                 if title == "Original":
                     ax.imshow(data)
-                else:
-                    im = ax.imshow(data, cmap="viridis")
+                else:    
+                    if title == "Latent Entropy" or title == "Hyper Entropy":
+                        im = ax.imshow(data, cmap="viridis", vmin=0)
+                    else:
+                        im = ax.imshow(data, cmap="viridis")
                     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_title(title)
                 ax.axis("off")
@@ -158,21 +177,24 @@ class CompressionEvaluator:
             mus = out["mus"][0, :, high_c]             # [K,H,W]
             sigmas = out["sigmas"][0, :, high_c]       # [K,H,W]
             latent = latents[high_c]                # [H,W]
-            latent_entropy = -entropy[high_c] / math.log(2.0)
-            hyper_entropy = -out["logp_z"][0, high_c] / math.log(2.0)
+            hyper_latent = hyper_latents[high_cz]     # [H,W]
+            norm_latent = (latent - mus) / (sigmas + 1e-12) # should be [K,H,W], normalized latents for each component
+            latent_entropy = -entropies[high_c] / math.log(2.0)
+            #print(latent_entropy.min().item(), latent_entropy.mean().item(), latent_entropy.max().item()) 
+            hyper_entropy = -hyper_entropies[high_cz] / math.log(2.0) 
+            #print(hyper_entropy.min().item(), hyper_entropy.mean().item(), hyper_entropy.max().item()) 
             K = mus.shape[0]
             
             # One row per component
             fig, axes = plt.subplots(K+1, 6, figsize=(18, 3*(K+1)))
             for k in range(K):
-                pred_error = latent - mus[k]
                 maps = [
-                    (f"Comp {k} Weight", weights[k].cpu().numpy()),
-                    (f"Comp {k} Mean", mus[k].cpu().numpy()),
-                    (f"Comp {k} Pred Error", pred_error.cpu().numpy()),
-                    (f"Comp {k} Sigma", sigmas[k].cpu().numpy()),
-                    ("Latent Entropy", latent_entropy.cpu().numpy()),
-                    ("Hyper Entropy", hyper_entropy.cpu().numpy())
+                    (f"Comp {k} Weight", normalize_map(weights[k].cpu().numpy())),
+                    (f"Comp {k} Mean", normalize_map(mus[k].cpu().numpy())),
+                    (f"Comp {k} Sigma", normalize_map(sigmas[k].cpu().numpy())),
+                    (f"Comp {k} Norm Latent", normalize_map(norm_latent[k].cpu().numpy())),
+                    ("Latent", normalize_map(latent.cpu().numpy())),
+                    ("Hyper Latent", normalize_map(hyper_latent.cpu().numpy()))
                 ]
                 for ax, (title, data) in zip(axes[k], maps):
                     im = ax.imshow(data, cmap="viridis")
@@ -184,13 +206,13 @@ class CompressionEvaluator:
             mixture_mean = torch.sum(weights * mus, dim=0)  # [H,W]
             mixture_var = torch.sum(weights * (sigmas**2 + mus**2), dim=0) - mixture_mean**2
             mixture_sigma = torch.sqrt(mixture_var.clamp(min=1e-9))
+            mixture_norm = (latent - mixture_mean) / mixture_sigma 
             
-            mixture_error = latent - mixture_mean
             maps = [
                 ("Original", img_np),
-                ("Mixture Mean", mixture_mean.cpu().numpy()),
-                ("Mixture Sigma", mixture_sigma.cpu().numpy()),
-                ("Mixture Error", mixture_error.cpu().numpy()),
+                ("Mixture Mean", normalize_map(mixture_mean.cpu().numpy())),
+                ("Mixture Sigma", normalize_map(mixture_sigma.cpu().numpy())),
+                ("Mixture Norm", normalize_map(mixture_norm.cpu().numpy())),
                 ("Latent Entropy", latent_entropy.cpu().numpy()),
                 ("Hyper Entropy", hyper_entropy.cpu().numpy()),   
             ]
@@ -198,7 +220,10 @@ class CompressionEvaluator:
                 if title == "Original":
                     ax.imshow(data)
                 else:
-                    im = ax.imshow(data, cmap="viridis")
+                    if title == "Latent Entropy" or title == "Hyper Entropy":
+                        im = ax.imshow(data, cmap="viridis", vmin=0)
+                    else:
+                        im = ax.imshow(data, cmap="viridis")
                     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_title(title)
                 ax.axis("off")
@@ -215,7 +240,6 @@ class CompressionEvaluator:
             for k, v in metrics.items():
                 f.write(f"{k}: {v:.6f}\n")
         print(f"Results saved to {path}")
-
 
 
 class VisionCompressionEvaluator:

@@ -1,5 +1,3 @@
-import os
-import glob
 import random
 import argparse
 from pathlib import Path
@@ -7,8 +5,9 @@ from PIL import Image, UnidentifiedImageError
 import numpy as np
 from tqdm import tqdm
 
+# ( AI Generated )
 # --------------------
-# Helper functions ( AI Generated )
+# Helper functions 
 # --------------------
 def add_quantization_noise(img, levels=256):
     np_img = np.array(img).astype(np.float32) / 255.0

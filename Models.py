@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from Components import Encoder, Decoder, HyperEncoder, HyperDecoder, LatentSpaceTransform
+from Components import Encoder5x5, Decoder5x5, HyperEncoder5x5, HyperDecoder5x5, Encoder3x3, Decoder3x3, HyperEncoder3x3, HyperDecoder3x3, LatentSpaceTransform
 from ContextModels import ContextModel
 from EntropyModels import FactorizedEntropyBottleneck, GaussianConditional, GaussianMixtureConditional
 from ParametersModels import EntropyParameters
@@ -13,12 +13,10 @@ class JointAutoregressiveHierarchical(nn.Module):
     K : int, default=1, Number of mixture components. 
         If K=1 → Mean-Scale Gaussian.
         If K>1 → Mixture of Gaussians.
-    use_gdn : bool, default=True, Whether to use GDN activations in encoder/decoder.
     """
     def __init__(self,
                  latent_channels: int = 192,
                  K: int = 1, 
-                 use_gdn = True
                 ):
         super().__init__()
 
@@ -33,10 +31,109 @@ class JointAutoregressiveHierarchical(nn.Module):
         self.distribution = 'Mean-Scale Gaussian' if K == 1 else 'Mixture of Gaussians'
         self.conditional = GaussianConditional() if K == 1 else GaussianMixtureConditional()
         
-        self.encoder = Encoder(latent_channels=self.M, use_gdn=use_gdn)
-        self.decoder = Decoder(latent_channels=self.M, use_gdn=use_gdn)
-        self.hyper_encoder = HyperEncoder(latent_channels=self.M)
-        self.hyper_decoder = HyperDecoder(latent_channels=self.M)
+        self.encoder = Encoder5x5(latent_channels=self.M,)
+        self.decoder = Decoder5x5(latent_channels=self.M)
+        self.hyper_encoder = HyperEncoder5x5(latent_channels=self.M)
+        self.hyper_decoder = HyperDecoder5x5(latent_channels=self.M)
+        self.factorized_entropy_model = FactorizedEntropyBottleneck(self.M)
+        # context model: takes y (M channels) -> context_out_channels (e.g. 2*M)
+        self.context_model = ContextModel(latent_channels=self.M)
+        # entropy params: takes concat(hyper_out, context_out) (4*M) -> mu, scale (2*M), or weights, mus, scales
+        self.entropy_parameters = EntropyParameters(
+            latent_channels=self.M,
+            hyper_latent_channels=self.H,
+            K=self.K
+        )
+        
+
+    def forward(self, x: torch.Tensor, training: bool = True):
+
+        # analysis transform
+        y = self.encoder(x)      # shape [B, M, Hy, Wy]
+        z = self.hyper_encoder(y)  # shape [B, M, Hz, Wz]
+
+        if training:
+            # additive uniform noise relaxation
+            z_tilde = z + (torch.rand_like(z) - 0.5)
+            y_tilde = y + (torch.rand_like(y) - 0.5)
+            z_in = z_tilde
+            y_in = y_tilde
+        else:
+            # inference: quantize
+            z_q = torch.round(z)
+            y_q = torch.round(y)
+            z_in = z_q
+            y_in = y_q
+
+        # hyper synthesis -> hyper features
+        psi = self.hyper_decoder(z_in)  # shape [B, 2*M, H', W']
+        # context model using masked convs: training uses relaxed y_tilde (parallel masked conv)
+        phi = self.context_model(y_in)  # shape [B, 2*M, H', W']
+        # combine features and predict mu and sigma for y
+        combined = torch.cat([phi, psi], dim=1) # shape [B, 4*M, H', W']
+
+        if self.distribution == 'Mean-Scale Gaussian':
+            mu, sigma = self.entropy_parameters(combined)  # each [B, M, H', W']
+            params = {"mu": mu, "sigma": sigma}
+        if self.distribution == 'Mixture of Gaussians':
+            weights, mus, sigmas = self.entropy_parameters(combined) # each [B, K, M, H', W']
+            params = {"weights": weights, "mus": mus, "sigmas": sigmas}
+        
+        # likelihoods:
+        p_z = self.factorized_entropy_model(z_in) # [B, M, Hz, Wz], probabilities (training: z_tilde)
+        logp_z = torch.log(p_z)
+        
+        p_y = self.conditional(y_in, **params)
+        logp_y = torch.log(p_y) # [B, M, Hy, Wy], probabilities (training: y_tilde)
+           
+        # synthesis / reconstruction uses relaxed or quantized y
+        x_hat = self.decoder(y_in)
+
+        out = {
+            'x_hat': x_hat,
+            'y': y,
+            'y_in': y_in,          # y_tilde (train) or y_q (eval)
+            'z': z,
+            'z_in': z_in,          # z_tilde (train) or z_q (eval)
+            'p_z': p_z,
+            'logp_z': logp_z,
+            'p_y': p_y,
+            'logp_y': logp_y,
+            'training': training,
+        }
+        out.update(params)
+        
+        return out
+
+
+class HierarchicalMixtureResidual(nn.Module):
+    """
+    latent_channels : int, default=192, Number of channels in bottleneck y (M).
+    K : int, default=1, Number of mixture components. 
+        If K=1 → Mean-Scale Gaussian.
+        If K>1 → Mixture of Gaussians.
+    """
+    def __init__(self,
+                 latent_channels: int = 192,
+                 K: int = 1, 
+                ):
+        super().__init__()
+
+        if not isinstance(latent_channels, int) or latent_channels < 1:
+            raise ValueError(f"latent_channels must be int >= 1, got {latent_channels}")
+        if not isinstance(K, int) or K < 1:
+            raise ValueError(f"K must be int >= 1, got {K}")
+        
+        self.M = latent_channels
+        self.K = K
+        self.H = latent_channels # hyper_latents
+        self.distribution = 'Mean-Scale Gaussian' if K == 1 else 'Mixture of Gaussians'
+        self.conditional = GaussianConditional() if K == 1 else GaussianMixtureConditional()
+        
+        self.encoder = Encoder3x3(latent_channels=self.M,)
+        self.decoder = Decoder3x3(latent_channels=self.M)
+        self.hyper_encoder = HyperEncoder3x3(latent_channels=self.M)
+        self.hyper_decoder = HyperDecoder3x3(latent_channels=self.M)
         self.factorized_entropy_model = FactorizedEntropyBottleneck(self.M)
         # context model: takes y (M channels) -> context_out_channels (e.g. 2*M)
         self.context_model = ContextModel(latent_channels=self.M)
@@ -115,13 +212,11 @@ class ScalableImageCoding(nn.Module):
     K : int, default=1, Number of mixture components. 
         If K=1 → Mean-Scale Gaussian.
         If K>1 → Mixture of Gaussians.
-    use_gdn : bool, default=True, Whether to use GDN activations in encoder/decoder.
     """
     def __init__(self,
                  latent_channels: int = 192,
                  base_channels: int= 128,
                  K: int = 1, 
-                 use_gdn = True
                 ):
         super().__init__()
 
@@ -138,10 +233,10 @@ class ScalableImageCoding(nn.Module):
         self.distribution = 'Mean-Scale Gaussian' if K == 1 else 'Mixture of Gaussians'
         self.conditional = GaussianConditional() if K == 1 else GaussianMixtureConditional()
         
-        self.encoder = Encoder(latent_channels=self.M, use_gdn=use_gdn)
-        self.decoder = Decoder(latent_channels=self.M, use_gdn=use_gdn)
-        self.hyper_encoder = HyperEncoder(latent_channels=self.M)
-        self.hyper_decoder = HyperDecoder(latent_channels=self.M)
+        self.encoder = Encoder5x5(latent_channels=self.M)
+        self.decoder = Decoder5x5(latent_channels=self.M)
+        self.hyper_encoder = HyperEncoder5x5(latent_channels=self.M)
+        self.hyper_decoder = HyperDecoder5x5(latent_channels=self.M)
         self.factorized_entropy_model = FactorizedEntropyBottleneck(self.M)
         # context model: takes y (M channels) -> context_out_channels (e.g. 2*M)
         self.context_model_1 = ContextModel(latent_channels=self.M1)

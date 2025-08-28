@@ -150,7 +150,7 @@ class Trainer:
         with torch.no_grad():
             for imgs in self.val_loader:
                 imgs = imgs.to(self.device)
-                model_out = self.model(imgs)
+                model_out = self.model(imgs, training=False)
                 results = self.rd_loss(model_out, imgs, self.lambda_val)
                 total_loss += results['loss'].item()
                 bpp_loss += results['bpp_total']
